@@ -7,12 +7,11 @@ import java.io.*;
 import java.net.*;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
 import java.util.*;
 
 public class StockServer {
 
-    private static final String API_KEY = System.getenv().getOrDefault("ALPHA_VANTAGE_KEY", "demo");
-    private static final String BASE_URL = "https://www.alphavantage.co/query";
     private static final int PORT = 8080;
 
     record DayRecord(String date, double open, double high, double low, double close,
@@ -20,80 +19,258 @@ public class StockServer {
 
     public static void main(String[] args) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
-        server.createContext("/", StockServer::serveHtml);
-        server.createContext("/api/stock", StockServer::serveStockData);
+        server.createContext("/api/stock",  StockServer::serveStockData);
+        server.createContext("/api/search", StockServer::serveSearch);
+        server.createContext("/api/chart",  StockServer::serveChart);
+        server.createContext("/",           StockServer::serveStatic);
         server.setExecutor(null);
         server.start();
         System.out.println("Stock Analyzer running at http://localhost:" + PORT);
     }
 
-    private static void serveHtml(HttpExchange ex) throws IOException {
-        respond(ex, 200, "text/html; charset=UTF-8", HTML.getBytes(StandardCharsets.UTF_8));
+    // ── Static files ──────────────────────────────────────────────────────
+
+    private static void serveStatic(HttpExchange ex) throws IOException {
+        String path = ex.getRequestURI().getPath();
+        if (path.equals("/")) path = "/index.html";
+        try (InputStream is = StockServer.class.getResourceAsStream("/static" + path)) {
+            if (is == null) { respond(ex, 404, "text/plain", "404 Not Found".getBytes()); return; }
+            byte[] body = is.readAllBytes();
+            ex.getResponseHeaders().set("Content-Type", mimeType(path));
+            ex.sendResponseHeaders(200, body.length);
+            try (OutputStream os = ex.getResponseBody()) { os.write(body); }
+        }
     }
 
-    private static void serveStockData(HttpExchange ex) throws IOException {
-        String symbol = parseSymbol(ex.getRequestURI().getQuery());
+    private static String mimeType(String path) {
+        if (path.endsWith(".html")) return "text/html; charset=UTF-8";
+        if (path.endsWith(".css"))  return "text/css";
+        if (path.endsWith(".js"))   return "application/javascript";
+        if (path.endsWith(".json")) return "application/json";
+        return "text/plain";
+    }
+
+    // ── /api/search ───────────────────────────────────────────────────────
+
+    private static void serveSearch(HttpExchange ex) throws IOException {
+        String q    = parseQuery(ex.getRequestURI().getQuery()).getOrDefault("q", "");
         String json;
-        try {
-            json = buildStockJson(symbol);
-        } catch (Exception e) {
-            json = "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
-        }
+        try { json = buildSearchJson(q); }
+        catch (Exception e) { json = "{\"results\":[]}"; }
         ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
         respond(ex, 200, "application/json", json.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String parseSymbol(String query) {
-        if (query == null) return "IBM";
-        for (String kv : query.split("&")) {
-            String[] parts = kv.split("=", 2);
-            if (parts.length == 2 && parts[0].equals("symbol")) return parts[1].toUpperCase();
+    private static String buildSearchJson(String q) throws Exception {
+        if (q.isBlank()) return "{\"results\":[]}";
+        String enc = URLEncoder.encode(q.strip(), StandardCharsets.UTF_8);
+        String url = "https://query1.finance.yahoo.com/v1/finance/search?q=" + enc
+                   + "&quotesCount=8&newsCount=0&listsCount=0&enableFuzzyQuery=false";
+
+        HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url))
+                .header("User-Agent", "Mozilla/5.0").GET().build();
+        HttpResponse<String> resp = httpClient().send(req, HttpResponse.BodyHandlers.ofString());
+
+        JsonObject root   = JsonParser.parseString(resp.body()).getAsJsonObject();
+        JsonArray  quotes = root.has("quotes") ? root.getAsJsonArray("quotes") : new JsonArray();
+
+        JsonArray results = new JsonArray();
+        for (JsonElement el : quotes) {
+            JsonObject qt   = el.getAsJsonObject();
+            String     type = qt.has("quoteType") ? qt.get("quoteType").getAsString() : "";
+            if (!type.equals("EQUITY") && !type.equals("ETF")) continue;
+            JsonObject item = new JsonObject();
+            item.addProperty("symbol",   qt.get("symbol").getAsString());
+            item.addProperty("name",     qt.has("shortname") ? qt.get("shortname").getAsString()
+                                       : qt.has("longname")  ? qt.get("longname").getAsString() : "");
+            item.addProperty("exchange", qt.has("exchange") ? qt.get("exchange").getAsString() : "");
+            results.add(item);
         }
-        return "IBM";
+        JsonObject out = new JsonObject();
+        out.add("results", results);
+        return new Gson().toJson(out);
+    }
+
+    // ── /api/chart ────────────────────────────────────────────────────────
+
+    private static void serveChart(HttpExchange ex) throws IOException {
+        Map<String, String> params = parseQuery(ex.getRequestURI().getQuery());
+        String symbol = params.getOrDefault("symbol", "AAPL").toUpperCase();
+        String period  = params.getOrDefault("period", "daily");
+        String json;
+        try { json = buildChartJson(symbol, period); }
+        catch (Exception e) { json = "{\"error\":\"" + safe(e.getMessage()) + "\"}"; }
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        respond(ex, 200, "application/json", json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String buildChartJson(String symbol, String period) throws Exception {
+        String enc = URLEncoder.encode(symbol, StandardCharsets.UTF_8);
+        String url = period.equals("weekly")
+            ? "https://query1.finance.yahoo.com/v8/finance/chart/" + enc + "?range=5d&interval=1d"
+            : "https://query1.finance.yahoo.com/v8/finance/chart/" + enc + "?range=1d&interval=5m";
+
+        JsonObject chart   = yahooFetch(url);
+        JsonArray  results = chart.getAsJsonArray("result");
+        if (results == null || results.size() == 0) throw new Exception("No chart data for: " + symbol);
+
+        JsonObject result = results.get(0).getAsJsonObject();
+        JsonArray  stamps = result.getAsJsonArray("timestamp");
+        JsonObject quote  = result.getAsJsonObject("indicators")
+                                  .getAsJsonArray("quote").get(0).getAsJsonObject();
+        JsonArray closes  = quote.getAsJsonArray("close");
+        JsonArray highs   = quote.getAsJsonArray("high");
+        JsonArray lows    = quote.getAsJsonArray("low");
+
+        JsonArray tsOut = new JsonArray(), pricesOut = new JsonArray(),
+                  hOut  = new JsonArray(), lOut      = new JsonArray();
+
+        for (int i = 0; i < stamps.size(); i++) {
+            if (closes.get(i).isJsonNull()) continue;
+            tsOut.add(stamps.get(i).getAsLong() * 1000L);
+            pricesOut.add(closes.get(i).getAsDouble());
+            hOut.add(highs.get(i).isJsonNull() ? closes.get(i) : highs.get(i));
+            lOut.add(lows.get(i).isJsonNull()  ? closes.get(i) : lows.get(i));
+        }
+
+        JsonObject out = new JsonObject();
+        out.addProperty("symbol", symbol);
+        out.addProperty("period", period);
+        out.add("timestamps", tsOut);
+        out.add("prices",     pricesOut);
+        out.add("highs",      hOut);
+        out.add("lows",       lOut);
+        return new Gson().toJson(out);
+    }
+
+    // ── /api/stock ────────────────────────────────────────────────────────
+
+    private static void serveStockData(HttpExchange ex) throws IOException {
+        String symbol = parseQuery(ex.getRequestURI().getQuery())
+                            .getOrDefault("symbol", "AAPL").toUpperCase();
+        String json;
+        try { json = buildStockJson(symbol); }
+        catch (Exception e) { json = "{\"error\":\"" + safe(e.getMessage()) + "\"}"; }
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        respond(ex, 200, "application/json", json.getBytes(StandardCharsets.UTF_8));
     }
 
     private static String buildStockJson(String symbol) throws Exception {
-        String url = BASE_URL + "?function=TIME_SERIES_DAILY&symbol=" + symbol + "&outputsize=full&apikey=" + API_KEY;
-        HttpClient client = HttpClient.newHttpClient();
-        HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url)).GET().build();
-        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        String enc = URLEncoder.encode(symbol, StandardCharsets.UTF_8);
 
-        JsonObject json = JsonParser.parseString(resp.body()).getAsJsonObject();
-        if (json.has("Error Message")) throw new Exception("Invalid symbol: " + symbol);
-        if (json.has("Information"))   throw new Exception("API rate limit reached — set ALPHA_VANTAGE_KEY env var.");
-        if (!json.has("Time Series (Daily)")) throw new Exception("Unexpected API response.");
+        // Historical daily (10 years)
+        JsonObject histChart = yahooFetch(
+                "https://query1.finance.yahoo.com/v8/finance/chart/" + enc + "?range=10y&interval=1d");
+        JsonArray results = histChart.getAsJsonArray("result");
+        if (results == null || results.size() == 0) throw new Exception("No data found for: " + symbol);
 
-        JsonObject ts = json.getAsJsonObject("Time Series (Daily)");
+        JsonObject histResult = results.get(0).getAsJsonObject();
+        JsonArray  stamps     = histResult.getAsJsonArray("timestamp");
+        JsonObject histQuote  = histResult.getAsJsonObject("indicators")
+                                          .getAsJsonArray("quote").get(0).getAsJsonObject();
+
+        JsonArray hOpens  = histQuote.getAsJsonArray("open");
+        JsonArray hHighs  = histQuote.getAsJsonArray("high");
+        JsonArray hLows   = histQuote.getAsJsonArray("low");
+        JsonArray hCloses = histQuote.getAsJsonArray("close");
+        JsonArray hVols   = histQuote.getAsJsonArray("volume");
+
         List<DayRecord> records = new ArrayList<>();
-
-        for (Map.Entry<String, JsonElement> entry : ts.entrySet()) {
-            JsonObject d = entry.getValue().getAsJsonObject();
-            double open  = d.get("1. open").getAsDouble();
-            double high  = d.get("2. high").getAsDouble();
-            double low   = d.get("3. low").getAsDouble();
-            double close = d.get("4. close").getAsDouble();
-            long   vol   = d.get("5. volume").getAsLong();
-            double range = high - low;
-            double o2c   = close - open;
-            double pct   = (o2c / open) * 100.0;
-            records.add(new DayRecord(entry.getKey(), open, high, low, close, vol, range, o2c, pct));
+        for (int i = 0; i < stamps.size(); i++) {
+            if (hOpens.get(i).isJsonNull() || hHighs.get(i).isJsonNull()
+                    || hLows.get(i).isJsonNull() || hCloses.get(i).isJsonNull()) continue;
+            String date  = LocalDate.ofEpochDay(stamps.get(i).getAsLong() / 86400).toString();
+            double open  = hOpens.get(i).getAsDouble(),  high  = hHighs.get(i).getAsDouble(),
+                   low   = hLows.get(i).getAsDouble(),   close = hCloses.get(i).getAsDouble();
+            long   vol   = hVols.get(i).isJsonNull() ? 0 : hVols.get(i).getAsLong();
+            records.add(new DayRecord(date, open, high, low, close, vol,
+                    high - low, close - open, ((close - open) / open) * 100.0));
         }
 
         records.sort(Comparator.comparingDouble(DayRecord::range).reversed());
         DayRecord best   = records.get(0);
         DayRecord latest = records.stream().max(Comparator.comparing(DayRecord::date)).orElseThrow();
 
-        JsonObject result = new JsonObject();
-        result.addProperty("symbol", symbol);
-        result.addProperty("totalDays", records.size());
-        result.add("bestDay",   toJson(best));
-        result.add("latestDay", toJson(latest));
+        // Today's intraday (1-minute bars)
+        JsonObject today = new JsonObject();
+        try {
+            JsonObject intra = yahooFetch(
+                    "https://query1.finance.yahoo.com/v8/finance/chart/" + enc + "?range=1d&interval=1m");
+            JsonArray ir = intra.getAsJsonArray("result");
+            if (ir != null && ir.size() > 0) {
+                JsonObject iq = ir.get(0).getAsJsonObject().getAsJsonObject("indicators")
+                                  .getAsJsonArray("quote").get(0).getAsJsonObject();
+                JsonArray iH = iq.getAsJsonArray("high"), iL = iq.getAsJsonArray("low"),
+                          iC = iq.getAsJsonArray("close");
 
+                double dayHigh = Double.NEGATIVE_INFINITY, dayLow = Double.POSITIVE_INFINITY, last = 0;
+                for (int i = 0; i < iH.size(); i++) {
+                    if (iH.get(i).isJsonNull() || iL.get(i).isJsonNull()) continue;
+                    dayHigh = Math.max(dayHigh, iH.get(i).getAsDouble());
+                    dayLow  = Math.min(dayLow,  iL.get(i).getAsDouble());
+                    if (!iC.get(i).isJsonNull()) last = iC.get(i).getAsDouble();
+                }
+
+                if (dayHigh > Double.NEGATIVE_INFINITY) {
+                    JsonObject meta = ir.get(0).getAsJsonObject().getAsJsonObject("meta");
+                    double prev = meta.has("chartPreviousClose") ? meta.get("chartPreviousClose").getAsDouble() : 0;
+                    today.addProperty("date",      LocalDate.now().toString());
+                    today.addProperty("high",      dayHigh);
+                    today.addProperty("low",       dayLow);
+                    today.addProperty("lastPrice", last);
+                    today.addProperty("range",     dayHigh - dayLow);
+                    today.addProperty("prevClose", prev);
+                    today.addProperty("changePct", prev > 0 ? ((last - prev) / prev) * 100.0 : 0);
+                    today.addProperty("live",      true);
+                } else {
+                    today.addProperty("live", false);
+                }
+            }
+        } catch (Exception ignored) { today.addProperty("live", false); }
+
+        JsonObject out = new JsonObject();
+        out.addProperty("symbol",    symbol);
+        out.addProperty("totalDays", records.size());
+        out.add("bestDay",   toJson(best));
+        out.add("latestDay", toJson(latest));
+        out.add("today",     today);
         JsonArray top = new JsonArray();
         records.subList(0, Math.min(10, records.size())).forEach(r -> top.add(toJson(r)));
-        result.add("topDays", top);
+        out.add("topDays", top);
+        return new Gson().toJson(out);
+    }
 
-        return new Gson().toJson(result);
+    // ── Shared helpers ────────────────────────────────────────────────────
+
+    private static HttpClient httpClient() {
+        return HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+    }
+
+    private static JsonObject yahooFetch(String url) throws Exception {
+        HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url))
+                .header("User-Agent", "Mozilla/5.0")
+                .header("Accept", "application/json")
+                .GET().build();
+        HttpResponse<String> resp = httpClient().send(req, HttpResponse.BodyHandlers.ofString());
+        JsonObject root  = JsonParser.parseString(resp.body()).getAsJsonObject();
+        JsonObject chart = root.getAsJsonObject("chart");
+        JsonElement err  = chart.get("error");
+        if (err != null && !err.isJsonNull())
+            throw new Exception(err.getAsJsonObject().get("description").getAsString());
+        return chart;
+    }
+
+    private static Map<String, String> parseQuery(String query) {
+        Map<String, String> map = new HashMap<>();
+        if (query == null) return map;
+        for (String kv : query.split("&")) {
+            String[] p = kv.split("=", 2);
+            if (p.length == 2) {
+                try { map.put(p[0], URLDecoder.decode(p[1], StandardCharsets.UTF_8)); }
+                catch (Exception e) { map.put(p[0], p[1]); }
+            }
+        }
+        return map;
     }
 
     private static JsonObject toJson(DayRecord r) {
@@ -110,155 +287,13 @@ public class StockServer {
         return o;
     }
 
+    private static String safe(String msg) {
+        return msg == null ? "Unknown error" : msg.replace("\"", "'");
+    }
+
     private static void respond(HttpExchange ex, int status, String type, byte[] body) throws IOException {
         ex.getResponseHeaders().set("Content-Type", type);
         ex.sendResponseHeaders(status, body.length);
         try (OutputStream os = ex.getResponseBody()) { os.write(body); }
     }
-
-    private static final String HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Stock Analyzer</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#000;color:#fff;font-family:'Courier New',Courier,monospace;min-height:100vh;padding:48px 24px}
-  .wrap{max-width:960px;margin:0 auto}
-
-  header{border-bottom:2px solid #fff;padding-bottom:20px;margin-bottom:32px}
-  h1{font-size:22px;letter-spacing:6px;text-transform:uppercase}
-  .sub{font-size:11px;color:#555;letter-spacing:3px;margin-top:4px}
-
-  .search{display:flex;margin-bottom:32px}
-  .search input{
-    flex:1;background:#000;color:#fff;border:1px solid #fff;
-    padding:14px 16px;font-family:inherit;font-size:15px;
-    text-transform:uppercase;outline:none;letter-spacing:2px
-  }
-  .search input::placeholder{color:#444}
-  .search button{
-    background:#fff;color:#000;border:1px solid #fff;
-    padding:14px 28px;font-family:inherit;font-size:13px;
-    font-weight:bold;cursor:pointer;letter-spacing:3px;
-    transition:background .1s
-  }
-  .search button:hover{background:#ccc}
-
-  .card{border:1px solid #333;padding:28px;margin-bottom:20px}
-  .card-title{font-size:10px;letter-spacing:4px;color:#555;text-transform:uppercase;margin-bottom:20px;border-bottom:1px solid #1a1a1a;padding-bottom:10px}
-
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:24px}
-  .stat-label{font-size:9px;letter-spacing:3px;color:#555;text-transform:uppercase;margin-bottom:6px}
-  .stat-value{font-size:18px;font-weight:bold}
-  .stat-value.xl{font-size:30px}
-  .neg{color:#888}
-
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  thead tr{border-bottom:1px solid #fff}
-  th{padding:8px 12px;text-align:right;font-size:9px;letter-spacing:2px;color:#555;text-transform:uppercase;font-weight:normal}
-  th:first-child{text-align:left}
-  td{padding:10px 12px;text-align:right;border-bottom:1px solid #111}
-  td:first-child{text-align:left}
-  tbody tr:first-child td{background:#0d0d0d;font-weight:bold}
-  tbody tr:hover td{background:#0a0a0a}
-
-  .status{text-align:center;padding:60px;color:#444;letter-spacing:3px;font-size:12px}
-  .err{border:1px solid #fff;padding:20px;letter-spacing:1px;font-size:13px}
-
-  footer{margin-top:48px;border-top:1px solid #1a1a1a;padding-top:16px;font-size:10px;color:#333;text-align:center;letter-spacing:2px}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <h1>Stock Analyzer</h1>
-    <div class="sub">Highest Single-Day Price Swing &mdash; Powered by Alpha Vantage</div>
-  </header>
-
-  <div class="search">
-    <input id="sym" type="text" placeholder="Enter ticker symbol..." value="IBM" maxlength="10"/>
-    <button onclick="load()">SEARCH</button>
-  </div>
-
-  <div id="out"><div class="status">ENTER A TICKER AND PRESS SEARCH</div></div>
-
-  <footer>Data via Alpha Vantage &bull; Free tier supports IBM without an API key &bull; Set ALPHA_VANTAGE_KEY for any ticker</footer>
-</div>
-
-<script>
-document.getElementById('sym').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
-
-function $(n){ return Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
-function p(n){ return (n>=0?'+':'')+Number(n).toFixed(2)+'%'; }
-function neg(n){ return n<0?'neg':''; }
-
-async function load() {
-  const sym = document.getElementById('sym').value.trim().toUpperCase();
-  if (!sym) return;
-  document.getElementById('out').innerHTML = '<div class="status">LOADING ' + sym + ' &hellip;</div>';
-  try {
-    const d = await fetch('/api/stock?symbol=' + encodeURIComponent(sym)).then(r => r.json());
-    if (d.error) { document.getElementById('out').innerHTML = '<div class="err">ERROR: ' + d.error + '</div>'; return; }
-    render(d);
-  } catch(e) {
-    document.getElementById('out').innerHTML = '<div class="err">ERROR: Could not reach server.</div>';
-  }
-}
-
-function render(d) {
-  const b = d.bestDay, l = d.latestDay;
-  document.getElementById('out').innerHTML = `
-  <div class="card">
-    <div class="card-title">Champion Day &mdash; Highest Intraday Swing &mdash; ${d.symbol} &mdash; ${d.totalDays.toLocaleString()} trading days analyzed</div>
-    <div class="grid">
-      <div><div class="stat-label">Date</div><div class="stat-value">${b.date}</div></div>
-      <div><div class="stat-label">Intraday Range</div><div class="stat-value xl">$${$(b.range)}</div></div>
-      <div><div class="stat-label">Open &rarr; Close</div><div class="stat-value ${neg(b.o2cPct)}">${p(b.o2cPct)}</div></div>
-      <div><div class="stat-label">Open</div><div class="stat-value">$${$(b.open)}</div></div>
-      <div><div class="stat-label">High</div><div class="stat-value">$${$(b.high)}</div></div>
-      <div><div class="stat-label">Low</div><div class="stat-value">$${$(b.low)}</div></div>
-      <div><div class="stat-label">Close</div><div class="stat-value">$${$(b.close)}</div></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Top 10 Highest-Swing Days</div>
-    <table>
-      <thead><tr>
-        <th>Date</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Range (Hi&minus;Lo)</th><th>Open&rarr;Close</th>
-      </tr></thead>
-      <tbody>${d.topDays.map(r => `
-        <tr>
-          <td>${r.date}</td>
-          <td>$${$(r.open)}</td>
-          <td>$${$(r.high)}</td>
-          <td>$${$(r.low)}</td>
-          <td>$${$(r.close)}</td>
-          <td>$${$(r.range)}</td>
-          <td class="${neg(r.o2cPct)}">${p(r.o2cPct)}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Most Recent Session &mdash; ${l.date}</div>
-    <div class="grid">
-      <div><div class="stat-label">Open</div><div class="stat-value">$${$(l.open)}</div></div>
-      <div><div class="stat-label">High</div><div class="stat-value">$${$(l.high)}</div></div>
-      <div><div class="stat-label">Low</div><div class="stat-value">$${$(l.low)}</div></div>
-      <div><div class="stat-label">Close</div><div class="stat-value">$${$(l.close)}</div></div>
-      <div><div class="stat-label">Range</div><div class="stat-value">$${$(l.range)}</div></div>
-    </div>
-  </div>`;
-}
-
-window.onload = load;
-</script>
-</body>
-</html>
-""";
 }

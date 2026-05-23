@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stock Analyzer</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="header-accent"></div>
+      <h1>STOCK ANALYZER</h1>
+      <p class="sub">Real-Time Price Swings &bull; Powered by Yahoo Finance</p>
+    </header>
+
+    <div class="search-wrap">
+      <div class="search">
+        <input id="sym" type="text" placeholder="Search any stock or ETF&hellip;"
+               autocomplete="off" maxlength="20" spellcheck="false"/>
+        <button id="searchBtn">SEARCH</button>
+      </div>
+      <div id="dropdown" class="dropdown"></div>
+    </div>
+
+    <div id="out">
+      <div class="status">SEARCH FOR A STOCK TO BEGIN</div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
