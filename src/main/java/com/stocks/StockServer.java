@@ -19,13 +19,169 @@ public class StockServer {
 
     public static void main(String[] args) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
-        server.createContext("/api/stock",  StockServer::serveStockData);
-        server.createContext("/api/search", StockServer::serveSearch);
-        server.createContext("/api/chart",  StockServer::serveChart);
-        server.createContext("/",           StockServer::serveStatic);
+        server.createContext("/api/stock",            StockServer::serveStockData);
+        server.createContext("/api/search",           StockServer::serveSearch);
+        server.createContext("/api/chart",            StockServer::serveChart);
+        server.createContext("/api/auth/register",    StockServer::serveRegister);
+        server.createContext("/api/auth/login",       StockServer::serveLogin);
+        server.createContext("/api/auth/logout",      StockServer::serveLogout);
+        server.createContext("/api/auth/me",          StockServer::serveMe);
+        server.createContext("/api/portfolio",        StockServer::servePortfolio);
+        server.createContext("/api/history",          StockServer::serveHistory);
+        server.createContext("/",                     StockServer::serveStatic);
         server.setExecutor(null);
         server.start();
         System.out.println("Stock Analyzer running at http://localhost:" + PORT);
+    }
+
+    // ── Auth helpers ──────────────────────────────────────────────────────
+
+    private static String sessionToken(HttpExchange ex) {
+        String cookie = ex.getRequestHeaders().getFirst("Cookie");
+        if (cookie == null) return null;
+        for (String part : cookie.split(";")) {
+            String[] kv = part.strip().split("=", 2);
+            if (kv.length == 2 && kv[0].equals("session")) return kv[1];
+        }
+        return null;
+    }
+
+    private static String readBody(HttpExchange ex) throws IOException {
+        return new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+    }
+
+    // ── /api/auth/register ────────────────────────────────────────────────
+
+    private static void serveRegister(HttpExchange ex) throws IOException {
+        if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "application/json", "{\"error\":\"Method not allowed\"}".getBytes()); return; }
+        JsonObject body = JsonParser.parseString(readBody(ex)).getAsJsonObject();
+        String username = body.has("username") ? body.get("username").getAsString() : "";
+        String password = body.has("password") ? body.get("password").getAsString() : "";
+        AuthService.AuthResult result = AuthService.register(username, password);
+        JsonObject out = new JsonObject();
+        out.addProperty("ok", result.ok());
+        out.addProperty("message", result.message());
+        if (result.ok()) out.addProperty("username", result.username());
+        byte[] bytes = new Gson().toJson(out).getBytes(StandardCharsets.UTF_8);
+        if (result.ok()) ex.getResponseHeaders().add("Set-Cookie",
+                "session=" + result.token() + "; Path=/; HttpOnly; Max-Age=604800");
+        respond(ex, result.ok() ? 200 : 400, "application/json", bytes);
+    }
+
+    // ── /api/auth/login ───────────────────────────────────────────────────
+
+    private static void serveLogin(HttpExchange ex) throws IOException {
+        if (!ex.getRequestMethod().equals("POST")) { respond(ex, 405, "application/json", "{\"error\":\"Method not allowed\"}".getBytes()); return; }
+        JsonObject body = JsonParser.parseString(readBody(ex)).getAsJsonObject();
+        String username = body.has("username") ? body.get("username").getAsString() : "";
+        String password = body.has("password") ? body.get("password").getAsString() : "";
+        AuthService.AuthResult result = AuthService.login(username, password);
+        JsonObject out = new JsonObject();
+        out.addProperty("ok", result.ok());
+        out.addProperty("message", result.message());
+        if (result.ok()) out.addProperty("username", result.username());
+        byte[] bytes = new Gson().toJson(out).getBytes(StandardCharsets.UTF_8);
+        if (result.ok()) ex.getResponseHeaders().add("Set-Cookie",
+                "session=" + result.token() + "; Path=/; HttpOnly; Max-Age=604800");
+        respond(ex, result.ok() ? 200 : 401, "application/json", bytes);
+    }
+
+    // ── /api/auth/logout ──────────────────────────────────────────────────
+
+    private static void serveLogout(HttpExchange ex) throws IOException {
+        AuthService.logout(sessionToken(ex));
+        ex.getResponseHeaders().add("Set-Cookie", "session=; Path=/; HttpOnly; Max-Age=0");
+        respond(ex, 200, "application/json", "{\"ok\":true}".getBytes());
+    }
+
+    // ── /api/auth/me ──────────────────────────────────────────────────────
+
+    private static void serveMe(HttpExchange ex) throws IOException {
+        var user = AuthService.validateSession(sessionToken(ex));
+        JsonObject out = new JsonObject();
+        out.addProperty("loggedIn", user.isPresent());
+        user.ifPresent(u -> out.addProperty("username", u));
+        respond(ex, 200, "application/json", new Gson().toJson(out).getBytes(StandardCharsets.UTF_8));
+    }
+
+    // ── /api/portfolio ────────────────────────────────────────────────────
+
+    private static void servePortfolio(HttpExchange ex) throws IOException {
+        var user = AuthService.validateSession(sessionToken(ex));
+        if (user.isEmpty()) { respond(ex, 401, "application/json", "{\"error\":\"Not logged in\"}".getBytes()); return; }
+        String method = ex.getRequestMethod();
+        try {
+            if (method.equals("GET")) {
+                JsonArray investments = PortfolioService.getInvestments(user.get());
+                JsonObject out = new JsonObject();
+                out.add("investments", investments);
+                respond(ex, 200, "application/json", new Gson().toJson(out).getBytes(StandardCharsets.UTF_8));
+            } else if (method.equals("POST")) {
+                JsonObject body = JsonParser.parseString(readBody(ex)).getAsJsonObject();
+                int id = PortfolioService.addInvestment(
+                        user.get(),
+                        body.get("symbol").getAsString(),
+                        body.get("shares").getAsDouble(),
+                        body.get("purchasePrice").getAsDouble(),
+                        body.get("purchaseDate").getAsString(),
+                        body.has("notes") ? body.get("notes").getAsString() : "");
+                respond(ex, 200, "application/json", ("{\"ok\":true,\"id\":" + id + "}").getBytes());
+            } else if (method.equals("DELETE")) {
+                String[] parts = ex.getRequestURI().getPath().split("/");
+                int id = Integer.parseInt(parts[parts.length - 1]);
+                boolean deleted = PortfolioService.deleteInvestment(user.get(), id);
+                respond(ex, 200, "application/json", ("{\"ok\":" + deleted + "}").getBytes());
+            } else {
+                respond(ex, 405, "application/json", "{\"error\":\"Method not allowed\"}".getBytes());
+            }
+        } catch (Exception e) {
+            respond(ex, 500, "application/json", ("{\"error\":\"" + safe(e.getMessage()) + "\"}").getBytes());
+        }
+    }
+
+    // ── /api/history ──────────────────────────────────────────────────────
+
+    private static void serveHistory(HttpExchange ex) throws IOException {
+        Map<String, String> params = parseQuery(ex.getRequestURI().getQuery());
+        String symbol = params.getOrDefault("symbol", "AAPL").toUpperCase();
+        String from   = params.getOrDefault("from",   LocalDate.now().minusYears(1).toString());
+        String json;
+        try { json = buildHistoryJson(symbol, from); }
+        catch (Exception e) { json = "{\"error\":\"" + safe(e.getMessage()) + "\"}"; }
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        respond(ex, 200, "application/json", json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String buildHistoryJson(String symbol, String from) throws Exception {
+        String enc     = URLEncoder.encode(symbol, StandardCharsets.UTF_8);
+        long   period1 = LocalDate.parse(from).toEpochDay() * 86400L;
+        long   period2 = LocalDate.now().toEpochDay() * 86400L + 86400L;
+        String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + enc
+                   + "?period1=" + period1 + "&period2=" + period2 + "&interval=1d";
+
+        JsonObject chart   = yahooFetch(url);
+        JsonArray  results = chart.getAsJsonArray("result");
+        if (results == null || results.size() == 0) throw new Exception("No history for: " + symbol);
+
+        JsonObject result = results.get(0).getAsJsonObject();
+        JsonArray  stamps = result.getAsJsonArray("timestamp");
+        JsonArray  closes = result.getAsJsonObject("indicators")
+                                  .getAsJsonArray("quote").get(0).getAsJsonObject()
+                                  .getAsJsonArray("close");
+
+        JsonArray dates  = new JsonArray();
+        JsonArray prices = new JsonArray();
+        for (int i = 0; i < stamps.size(); i++) {
+            if (closes.get(i).isJsonNull()) continue;
+            dates.add(LocalDate.ofEpochDay(stamps.get(i).getAsLong() / 86400).toString());
+            prices.add(closes.get(i).getAsDouble());
+        }
+
+        JsonObject out = new JsonObject();
+        out.addProperty("symbol", symbol);
+        out.add("dates",  dates);
+        out.add("prices", prices);
+        return new Gson().toJson(out);
     }
 
     // ── Static files ──────────────────────────────────────────────────────

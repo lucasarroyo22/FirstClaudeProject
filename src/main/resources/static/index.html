@@ -7,24 +7,86 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+
+  <!-- Auth Modal -->
+  <div id="authOverlay" class="auth-overlay hidden">
+    <div class="auth-modal">
+      <div class="auth-tabs">
+        <button class="auth-tab active" id="tabLogin"    onclick="showAuthTab('login')">LOGIN</button>
+        <button class="auth-tab"        id="tabRegister" onclick="showAuthTab('register')">REGISTER</button>
+      </div>
+      <div id="authError" class="auth-error hidden"></div>
+      <input id="authUsername" type="text"     placeholder="Username" autocomplete="off" spellcheck="false"/>
+      <input id="authPassword" type="password" placeholder="Password"/>
+      <button id="authSubmit" onclick="submitAuth()">LOGIN</button>
+    </div>
+  </div>
+
   <div class="wrap">
     <header>
-      <div class="header-accent"></div>
-      <h1>STOCK ANALYZER</h1>
-      <p class="sub">Real-Time Price Swings &bull; Powered by Yahoo Finance</p>
+      <div class="header-top">
+        <div>
+          <div class="header-accent"></div>
+          <h1>STOCK ANALYZER</h1>
+          <p class="sub">Real-Time Price Swings &bull; Powered by Yahoo Finance</p>
+        </div>
+        <div id="authControls" class="auth-controls">
+          <span id="userGreeting" class="user-greeting hidden"></span>
+          <button id="authBtn" onclick="openAuth()">LOGIN / REGISTER</button>
+          <button id="logoutBtn" class="hidden" onclick="logout()">LOGOUT</button>
+        </div>
+      </div>
     </header>
 
-    <div class="search-wrap">
-      <div class="search">
-        <input id="sym" type="text" placeholder="Search any stock or ETF&hellip;"
-               autocomplete="off" maxlength="20" spellcheck="false"/>
-        <button id="searchBtn">SEARCH</button>
-      </div>
-      <div id="dropdown" class="dropdown"></div>
+    <!-- Nav tabs -->
+    <div class="nav-tabs">
+      <button class="nav-tab active" id="navSearch"    onclick="switchNav('search')">SEARCH</button>
+      <button class="nav-tab"        id="navPortfolio" onclick="switchNav('portfolio')">PORTFOLIO</button>
     </div>
 
-    <div id="out">
-      <div class="status">SEARCH FOR A STOCK TO BEGIN</div>
+    <!-- Search view -->
+    <div id="viewSearch">
+      <div class="search-wrap">
+        <div class="search">
+          <input id="sym" type="text" placeholder="Search any stock or ETF&hellip;"
+                 autocomplete="off" maxlength="20" spellcheck="false"/>
+          <button id="searchBtn">SEARCH</button>
+        </div>
+        <div id="dropdown" class="dropdown"></div>
+      </div>
+      <div id="out">
+        <div class="status">SEARCH FOR A STOCK TO BEGIN</div>
+      </div>
+    </div>
+
+    <!-- Portfolio view -->
+    <div id="viewPortfolio" class="hidden">
+      <div id="portfolioOut">
+        <div class="status">LOGIN TO VIEW YOUR PORTFOLIO</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stock Detail Panel -->
+  <div id="stockDetailOverlay" class="stock-detail-overlay hidden" onclick="if(event.target===this)closeStockDetail()">
+    <div class="stock-detail-panel">
+      <div class="detail-header">
+        <div>
+          <div class="detail-symbol" id="detailSymbol">—</div>
+          <div class="detail-meta" id="detailMeta">POSITION DETAIL</div>
+        </div>
+        <button class="detail-close" onclick="closeStockDetail()">&#x2715;</button>
+      </div>
+      <div id="detailPriceBar" class="detail-price-bar"></div>
+      <div class="chart-tabs" id="detailTabs">
+        <button class="tab-btn active" onclick="switchDetailTab('daily')">TODAY</button>
+        <button class="tab-btn"        onclick="switchDetailTab('weekly')">5 DAYS</button>
+      </div>
+      <div class="chart-container detail-chart">
+        <div class="chart-loading" id="detailChartLoading">LOADING &hellip;</div>
+        <canvas id="detailChartCanvas" style="display:none"></canvas>
+      </div>
+      <div id="detailPosition" class="detail-position-grid"></div>
     </div>
   </div>
 
