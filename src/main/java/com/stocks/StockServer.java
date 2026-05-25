@@ -203,6 +203,9 @@ public class StockServer {
         if (path.endsWith(".css"))  return "text/css";
         if (path.endsWith(".js"))   return "application/javascript";
         if (path.endsWith(".json")) return "application/json";
+        if (path.endsWith(".svg"))  return "image/svg+xml";
+        if (path.endsWith(".ico"))  return "image/x-icon";
+        if (path.endsWith(".png"))  return "image/png";
         return "text/plain";
     }
 
@@ -261,10 +264,28 @@ public class StockServer {
     }
 
     private static String buildChartJson(String symbol, String period) throws Exception {
-        String enc = URLEncoder.encode(symbol, StandardCharsets.UTF_8);
-        String url = period.equals("weekly")
-            ? "https://query1.finance.yahoo.com/v8/finance/chart/" + enc + "?range=5d&interval=1d"
-            : "https://query1.finance.yahoo.com/v8/finance/chart/" + enc + "?range=1d&interval=5m";
+        String enc  = URLEncoder.encode(symbol, StandardCharsets.UTF_8);
+        long   now  = LocalDate.now().toEpochDay() * 86400L;
+        long   p2   = now + 86400L;
+        String url;
+        if (period.equals("monthly")) {
+            long p1 = LocalDate.now().minusDays(30).toEpochDay() * 86400L;
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/" + enc
+                + "?period1=" + p1 + "&period2=" + p2 + "&interval=1d";
+        } else if (period.equals("yearly")) {
+            long p1 = LocalDate.now().minusYears(1).toEpochDay() * 86400L;
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/" + enc
+                + "?period1=" + p1 + "&period2=" + p2 + "&interval=1wk";
+        } else if (period.equals("alltime")) {
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/" + enc
+                + "?period1=0&period2=" + p2 + "&interval=1mo";
+        } else if (period.equals("weekly")) {
+            long p1 = LocalDate.now().minusDays(5).toEpochDay() * 86400L;
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/" + enc
+                + "?period1=" + p1 + "&period2=" + p2 + "&interval=1d";
+        } else {
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/" + enc + "?range=1d&interval=5m";
+        }
 
         JsonObject chart   = yahooFetch(url);
         JsonArray  results = chart.getAsJsonArray("result");

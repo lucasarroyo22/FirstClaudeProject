@@ -172,10 +172,11 @@ h1 {
 .card-title {
   font-size: 11px;
   letter-spacing: 3px;
-  color: var(--label);
+  color: var(--white);
   text-transform: uppercase;
   margin-bottom: 20px;
-  padding-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--red);
   border-bottom: 1px solid var(--red-dim);
   display: flex;
   align-items: center;
